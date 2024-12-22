@@ -1,10 +1,8 @@
 package org.example;
 
-import com.hazelcast.cluster.MembershipEvent;
-import com.hazelcast.cluster.MembershipListener;
+import com.hazelcast.config.*;
 import com.hazelcast.core.*;
 import com.hazelcast.map.IMap;
-import com.hazelcast.config.Config;
 import com.hazelcast.core.Hazelcast;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
@@ -17,65 +15,81 @@ public class MatrixMultiplicationDistributor {
     private static CountDownLatch latch;
 
     public static void main(String[] args) throws Exception {
-        // Start Hazelcast instance
         Config config = new Config();
-        config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(true);
+
+        // Configuración de serialización personalizada
+        SerializationConfig serializationConfig = config.getSerializationConfig();
+        serializationConfig.addSerializerConfig(new SerializerConfig()
+                .setTypeClass(MatrixBlockMultiplicationTask.class)
+                .setImplementation(new MatrixBlockMultiplicationTaskSerializer()));
+
+        // Configuración de red
+        NetworkConfig networkConfig = config.getNetworkConfig();
+        networkConfig.getJoin().getMulticastConfig().setEnabled(false); // Desactivar multicast
+
+        TcpIpConfig tcpIpConfig = networkConfig.getJoin().getTcpIpConfig();
+        tcpIpConfig.setEnabled(true);
+        tcpIpConfig.addMember("192.168.111.4"); // IP del primer equipo
+        tcpIpConfig.addMember("192.168.111.83"); // IP del segundo equipo
+
+        // Crear instancia de Hazelcast
         hazelcastInstance = Hazelcast.newHazelcastInstance(config);
-        resultMap = hazelcastInstance.getMap("results");
+        System.out.println("Hazelcast instance started.");
 
-        // Initialize latch to wait for 2 members (adjust as needed)
-        latch = new CountDownLatch(2); // Wait for 2 members, change as necessary
+        // Esperar a que el clúster tenga exactamente 2 miembros
+        waitForClusterToHaveTwoMembers();
 
-        // Register a MembershipListener to track when new members join
-        hazelcastInstance.getCluster().addMembershipListener(new MembershipListener() {
+        int matrixSize = 4;
+        int blockSize = 2;
+        int subBlockSize = 2;
 
-            @Override
-            public void memberAdded(MembershipEvent membershipEvent) {
-                latch.countDown();
-            }
-
-            public void memberRemoved(MembershipEvent membershipEvent) {
-                // Optionally handle member removal if needed
-            }
-        });
-
-        // Wait until there are at least 2 members in the cluster
-        latch.await();
-        System.out.println("At least 2 members connected, starting tasks...");
-
-        // Matrix size (5000x5000)
-        int matrixSize = 5000;
-        int blockSize = 500;
-        int subBlockSize = 50;
-
-        // Generate matrices
+        // Generar matrices
         int[][] matrixA = MatrixMultiplication.generateMatrix(matrixSize, matrixSize);
         int[][] matrixB = MatrixMultiplication.generateMatrix(matrixSize, matrixSize);
 
-        // Divide matrices into blocks and distribute tasks
+        // Dividir matrices en bloques y distribuir tareas
         distributeBlocks(matrixA, matrixB, blockSize, subBlockSize);
     }
 
+    private static void waitForClusterToHaveTwoMembers() throws InterruptedException {
+        // Esperar hasta que el clúster tenga exactamente 2 miembros
+        while (hazelcastInstance.getCluster().getMembers().size() != 2) {
+            System.out.println("Esperando a que haya exactamente 2 miembros en el clúster...");
+            Thread.sleep(1000); // Esperar un segundo antes de verificar nuevamente
+        }
+        System.out.println("El clúster tiene 2 miembros. Procediendo con la distribución de tareas.");
+    }
+
     public static void distributeBlocks(int[][] matrixA, int[][] matrixB, int blockSize, int subBlockSize) throws Exception {
+        resultMap = hazelcastInstance.getMap("resultMap");
+
         int blocks = matrixA.length / blockSize;
 
-        // Divide matrices into blocks of 500x500
+        // Inicializar el CountDownLatch con el número correcto de tareas
+        latch = new CountDownLatch(blocks * blocks);
+
+        // Dividir las matrices en bloques
         for (int i = 0; i < blocks; i++) {
             for (int j = 0; j < blocks; j++) {
                 int[][] blockA = extractBlock(matrixA, i * blockSize, j * blockSize, blockSize);
                 int[][] blockB = extractBlock(matrixB, i * blockSize, j * blockSize, blockSize);
 
-                // Submit task to Hazelcast for each block
+                // Enviar tarea a Hazelcast para cada bloque
                 Callable<int[][]> task = new MatrixBlockMultiplicationTask(blockA, blockB, subBlockSize);
+                System.out.println("Submitting task for block (" + i + ", " + j + ")");
                 Future<int[][]> future = hazelcastInstance.getExecutorService("blockExecutor").submit(task);
 
-                // Store result temporarily
+                // Almacenar el resultado temporalmente
                 resultMap.put(i + "_" + j, future.get());
+
+                // Disminuir el contador del latch cuando la tarea termine
+                latch.countDown();
             }
         }
 
-        // After all tasks complete, gather the final result
-        System.out.println("Matrix multiplication distributed and tasks executed!");
+        // Esperar a que todas las tareas terminen
+        latch.await();
+        assembleMatrix(matrixA.length, blockSize);
     }
 
     private static int[][] extractBlock(int[][] matrix, int startRow, int startCol, int size) {
@@ -87,4 +101,34 @@ public class MatrixMultiplicationDistributor {
         }
         return block;
     }
+
+    private static void assembleMatrix(int matrixSize, int blockSize) throws Exception {
+        int[][] resultMatrix = new int[matrixSize][matrixSize]; // Tamaño final de la matriz
+
+        // Ensamblar la matriz a partir de los bloques
+        int blocks = matrixSize / blockSize;
+
+        for (int i = 0; i < blocks; i++) {
+            for (int j = 0; j < blocks; j++) {
+                int[][] block = resultMap.get(i + "_" + j);
+                for (int k = 0; k < block.length; k++) {
+                    for (int l = 0; l < block[k].length; l++) {
+                        // Asegúrate de que los índices no excedan matrixSize
+                        int row = i * blockSize + k;
+                        int col = j * blockSize + l;
+
+                        if (row < matrixSize && col < matrixSize) { // Comprobación para evitar desbordamiento
+                            resultMatrix[row][col] = block[k][l];
+                        }
+                    }
+                }
+            }
+        }
+
+        // Mostrar el resultado de la multiplicación de matrices
+        System.out.println("Matrix Mutliplication Complete!");
+    }
+
+
+
 }
