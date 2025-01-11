@@ -32,7 +32,7 @@ public class MatrixBlockMultiplicationTaskSerializer implements StreamSerializer
 
     @Override
     public MatrixBlockMultiplicationTask read(ObjectDataInput in) throws IOException {
-        // Lee la matriz A
+        // matrix A
         int rowsA = in.readInt();
         int colsA = in.readInt();
         int[][] blockA = new int[rowsA][colsA];
@@ -51,16 +51,15 @@ public class MatrixBlockMultiplicationTaskSerializer implements StreamSerializer
             }
         }
 
-        // Lee el subBlockSize
         int subBlockSize = in.readInt();
 
-        // Devuelve el objeto deserializado
+
         return new MatrixBlockMultiplicationTask(blockA, blockB, subBlockSize);
     }
 
     @Override
     public int getTypeId() {
-        return 1; // Asigna un ID único para este tipo de objeto
+        return 1;
     }
 
     @Override
